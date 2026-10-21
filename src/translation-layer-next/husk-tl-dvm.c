@@ -14,6 +14,7 @@
 
 #include "husk-tl-bionic.h"
 #include "husk-tl-internal.h"
+#include "husk-tl-gc.h"
 #include "husk-tl-ld.h"
 
 int g_dvm_trace;
@@ -107,7 +108,7 @@ static bool dex_add(const uint8_t *b, size_t size, const char *label)
 {
     if (size < 0x70 || memcmp(b, "dex\n", 4)) { tl_log_line("dvm: %s is not a DEX file", label); return false; }
     if (g_ndex >= 256) return false;
-    dvm_dex *d = calloc(1, sizeof(*d));
+    dvm_dex *d = tl_gc_alloc_uncollectable(sizeof(*d));
     d->b = b; d->size = size;
     d->nstr = rd32(b + 0x38); d->str_off = rd32(b + 0x3c);
     d->ntype = rd32(b + 0x40); d->type_off = rd32(b + 0x44);
@@ -115,10 +116,10 @@ static bool dex_add(const uint8_t *b, size_t size, const char *label)
     d->nfield = rd32(b + 0x50); d->field_off = rd32(b + 0x54);
     d->nmeth = rd32(b + 0x58); d->meth_off = rd32(b + 0x5c);
     d->ncls = rd32(b + 0x60); d->cls_off = rd32(b + 0x64);
-    d->mcache = calloc(d->nmeth ? d->nmeth : 1, sizeof(*d->mcache));
-    d->fcache = calloc(d->nfield ? d->nfield : 1, sizeof(*d->fcache));
-    d->tcache = calloc(d->ntype ? d->ntype : 1, sizeof(*d->tcache));
-    d->scache = calloc(d->nstr ? d->nstr : 1, sizeof(*d->scache));
+    d->mcache = tl_gc_alloc((size_t)(d->nmeth ? d->nmeth : 1) * sizeof(*d->mcache));
+    d->fcache = tl_gc_alloc((size_t)(d->nfield ? d->nfield : 1) * sizeof(*d->fcache));
+    d->tcache = tl_gc_alloc((size_t)(d->ntype ? d->ntype : 1) * sizeof(*d->tcache));
+    d->scache = tl_gc_alloc((size_t)(d->nstr ? d->nstr : 1) * sizeof(*d->scache));
     snprintf(d->name, sizeof(d->name), "%s", label);
     d->ns = g_add_ns;
     int added = 0;
@@ -249,10 +250,13 @@ const uint16_t *tl_dvm_string_chars(jobj *s, int32_t *n)
     if (!s || s->kind != TL_K_STRING) { *n = 0; return NULL; }
     if (!s->str.u16) {
         int32_t len; uint16_t *u = utf8_to_u16(s->str.utf8 ? s->str.utf8 : "", &len);
-        pthread_mutex_lock(&g_lock);
-        if (!s->str.u16) { s->str.u16 = u; s->str.len16 = len; u = NULL; }
-        pthread_mutex_unlock(&g_lock);
+        uint16_t *managed = tl_gc_alloc_atomic((size_t)(len ? len : 1) * sizeof(*managed));
+        if (managed && u) memcpy(managed, u, (size_t)len * sizeof(*managed));
         free(u);
+        pthread_mutex_lock(&g_lock);
+        if (!s->str.u16) { s->str.u16 = managed; s->str.len16 = len; managed = NULL; }
+        pthread_mutex_unlock(&g_lock);
+        tl_gc_free(managed);
     }
     *n = s->str.len16;
     return s->str.u16;
@@ -263,9 +267,11 @@ static tl_jclass *g_string_class;
 jobj *tl_dvm_string_u16(const uint16_t *s, int32_t n)
 {
     jobj *o = tl_jni_new_string("");
-    free(o->str.utf8);
-    o->str.utf8 = u16_to_utf8(s, n);
-    o->str.u16 = malloc((size_t)(n ? n : 1) * 2);
+    tl_gc_free(o->str.utf8);
+    char *utf8 = u16_to_utf8(s, n);
+    o->str.utf8 = tl_gc_strdup(utf8);
+    free(utf8);
+    o->str.u16 = tl_gc_alloc_atomic((size_t)(n ? n : 1) * 2);
     if (n) memcpy(o->str.u16, s, (size_t)n * 2);
     o->str.len16 = n;
     o->refs = 1u << 30;
@@ -420,7 +426,7 @@ static bool same_package(const char *a, const char *b)
 static bool attach(tl_jclass *jc)
 {
     const char *name = jc->name;
-    dvm_class *c = calloc(1, sizeof(*c));
+    dvm_class *c = tl_gc_alloc_uncollectable(sizeof(*c));
     c->jc = jc; c->name = jc->name;
     pthread_mutex_init(&c->init_lock, NULL);
     static const struct { const char *n; char k; } prims[] = { { "int", 'I' }, { "long", 'J' }, { "float", 'F' }, { "double", 'D' },
@@ -439,7 +445,7 @@ static bool attach(tl_jclass *jc)
         return true;
     }
     cdef *cd = cdef_find(name);
-    if (!cd) { free(c); return false; }
+    if (!cd) { tl_gc_free(c); return false; }
     dvm_dex *d = cd->dex;
     const uint8_t *def = d->b + d->cls_off + 32 * cd->def;
     c->dex = d; c->def = cd->def;
@@ -455,7 +461,7 @@ static bool attach(tl_jclass *jc)
     uint32_t ifaces_off = rd32(def + 12);
     if (ifaces_off) {
         uint32_t n = rd32(d->b + ifaces_off);
-        c->ifaces = calloc(n, sizeof(*c->ifaces));
+        c->ifaces = tl_gc_alloc((size_t)n * sizeof(*c->ifaces));
         for (uint32_t i = 0; i < n; i++) c->ifaces[c->nifaces++] = resolve_type(d, rd16(d->b + ifaces_off + 4 + 2 * i));
     }
     c->nslots = c->super ? c->super->nslots : 0;
@@ -467,10 +473,10 @@ static bool attach(tl_jclass *jc)
         /* As ART lays them out (LengthPrefixedArray: a count, then the members back to back): fields instance then static,
          * methods direct then virtual. Class.fields/methods point at these, and code that walks ART's tables through Unsafe
          * (HiddenApiBypass) finds dvm_field/dvm_method entries a fixed stride apart. */
-        uint8_t *fb = calloc(1, DVM_MEMBERS_HDR + (nif + nsf + 1) * sizeof(dvm_field));
+        uint8_t *fb = tl_gc_alloc_uncollectable(DVM_MEMBERS_HDR + (size_t)(nif + nsf + 1) * sizeof(dvm_field));
         *(uint32_t *)fb = nif + nsf;
         c->inf = (dvm_field *)(fb + DVM_MEMBERS_HDR); c->sf = c->inf + nif;
-        uint8_t *mb = calloc(1, DVM_MEMBERS_HDR + (ndm + nvm + 1) * sizeof(dvm_method));
+        uint8_t *mb = tl_gc_alloc_uncollectable(DVM_MEMBERS_HDR + (size_t)(ndm + nvm + 1) * sizeof(dvm_method));
         *(uint32_t *)mb = ndm + nvm;
         c->dm = (dvm_method *)(mb + DVM_MEMBERS_HDR); c->vm = c->dm + ndm;
         c->art_tables = true;
@@ -516,7 +522,7 @@ static bool attach(tl_jclass *jc)
     }
     /* Statics: storage on the class itself (tl_jclass->statics), so JNI's GetStatic*Field find them. */
     if (c->nsf) {
-        jc->statics = calloc((size_t)c->nsf, sizeof(jvalue));
+        jc->statics = tl_gc_alloc((size_t)c->nsf * sizeof(jvalue));
         jc->nstatics = c->nsf;
         uint32_t sv = rd32(def + 28);
         if (sv) {
@@ -528,7 +534,7 @@ static bool attach(tl_jclass *jc)
     /* The vtable: the superclass's, overrides replacing entries (package-private methods only within their package), new
      * methods appended. A framework superclass (not interpreted) contributes nothing: its methods are found by name. */
     int sv_n = c->super ? c->super->nvtab : 0;
-    c->vtab = calloc((size_t)(sv_n + c->nvm + 1), sizeof(*c->vtab));
+    c->vtab = tl_gc_alloc((size_t)(sv_n + c->nvm + 1) * sizeof(*c->vtab));
     if (sv_n) memcpy(c->vtab, c->super->vtab, (size_t)sv_n * sizeof(*c->vtab));
     c->nvtab = sv_n;
     for (int i = 0; i < c->nvm; i++) {
@@ -623,12 +629,12 @@ jvalue *dvm_slots(jobj *o)
     dvm_class *c = dvm_class_of(jc);
     uint32_t n = c ? c->nslots : 0;
     if (!n) n = 1;
-    jvalue *f = calloc(n, sizeof(jvalue));
+    jvalue *f = tl_gc_alloc((size_t)n * sizeof(jvalue));
     pthread_mutex_lock(&g_lock);
     bool mine = !o->fields;
     if (mine) { __atomic_store_n(&o->fields, f, __ATOMIC_RELEASE); __atomic_store_n(&o->nfields, n, __ATOMIC_RELEASE); f = NULL; }
     pthread_mutex_unlock(&g_lock);
-    free(f);
+    tl_gc_free(f);
     if (mine && o->kind == TL_K_CLASS) { void dvm_fill_mirror(jobj *mirror); dvm_fill_mirror(o); }
     return o->fields;
 }
@@ -643,7 +649,7 @@ jvalue *dvm_grow_slots(jobj *o, uint32_t need)
         dvm_class *c = dvm_class_of(o->kind == TL_K_CLASS ? g_class_class : o->cls);
         uint32_t nn = need;
         if (c && c->nslots > nn) nn = c->nslots;
-        jvalue *f = calloc(nn, sizeof(jvalue));
+        jvalue *f = tl_gc_alloc((size_t)nn * sizeof(jvalue));
         if (o->fields && o->nfields) memcpy(f, o->fields, (size_t)o->nfields * sizeof(jvalue));
         __atomic_store_n(&o->fields, f, __ATOMIC_RELEASE);
         __atomic_store_n(&o->nfields, nn, __ATOMIC_RELEASE);
@@ -1043,7 +1049,7 @@ static bool dvm_call_inner(dvm_method *m, jobj *self, const jvalue *params, jval
         return dvm_throw("java/lang/AbstractMethodError", "%s.%s%s", m->cls->name, m->name, m->sig);
     }
     uint64_t small[64];
-    uint64_t *regs = m->regs <= 64 ? small : calloc(m->regs, sizeof(uint64_t));
+    uint64_t *regs = m->regs <= 64 ? small : tl_gc_alloc((size_t)m->regs * sizeof(uint64_t));
     if (regs == small) memset(small, 0, sizeof(uint64_t) * m->regs);
     int r = m->regs - m->ins;
     if (!(m->flags & 8)) regs[r++] = (uint64_t)(uintptr_t)self;
@@ -1061,7 +1067,7 @@ static bool dvm_call_inner(dvm_method *m, jobj *self, const jvalue *params, jval
         }
     }
     bool ok = interpret(m, regs, ret);
-    if (regs != small) free(regs);
+    if (regs != small) tl_gc_free(regs);
     return ok;
 }
 
@@ -1222,11 +1228,11 @@ static mref *resolve_mref(dvm_dex *d, uint32_t idx, bool is_static)
     (void)last;
     mref *r = (mref *)__atomic_load_n(&d->mcache[idx], __ATOMIC_ACQUIRE);
     if (r) return r;
-    r = calloc(1, sizeof(*r));
+    r = tl_gc_alloc_uncollectable(sizeof(*r));
     const uint8_t *mi = d->b + d->meth_off + 8 * idx;
     r->cls = resolve_type(d, rd16(mi));
     r->name = dex_str(d, rd32(mi + 4));
-    { char sg[8192], sh[300]; proto_sig(d, rd16(mi + 2), sg, sizeof(sg), sh, sizeof(sh), &r->nparams); r->sig = strdup(sg); r->shorty = strdup(sh); }
+    { char sg[8192], sh[300]; proto_sig(d, rd16(mi + 2), sg, sizeof(sg), sh, sizeof(sh), &r->nparams); r->sig = tl_gc_strdup(sg); r->shorty = tl_gc_strdup(sh); }
     dvm_class *c = dvm_class_of(r->cls);
     if (c) r->dm = dvm_find_method(c, r->name, r->sig, is_static);
     r->missing = !c && class_missing(r->cls);
@@ -1236,7 +1242,7 @@ static mref *resolve_mref(dvm_dex *d, uint32_t idx, bool is_static)
         for (tl_jclass *k = r->cls; k; k = k->super) if (!dvm_class_of(k)) { r->hm = tl_jni_method(k, r->name, r->sig, is_static); break; }
     }
     pthread_mutex_lock(&g_lock);
-    if (!d->mcache[idx]) __atomic_store_n(&d->mcache[idx], (dvm_method *)r, __ATOMIC_RELEASE); else { free(r); r = (mref *)d->mcache[idx]; }
+    if (!d->mcache[idx]) __atomic_store_n(&d->mcache[idx], (dvm_method *)r, __ATOMIC_RELEASE); else { tl_gc_free(r); r = (mref *)d->mcache[idx]; }
     pthread_mutex_unlock(&g_lock);
     return r;
 }
@@ -1249,7 +1255,7 @@ static fref *resolve_fref(dvm_dex *d, uint32_t idx, bool is_static)
 {
     fref *r = (fref *)__atomic_load_n(&d->fcache[idx], __ATOMIC_ACQUIRE);
     if (r) return r;
-    r = calloc(1, sizeof(*r));
+    r = tl_gc_alloc_uncollectable(sizeof(*r));
     const uint8_t *fi = d->b + d->field_off + 8 * idx;
     tl_jclass *cls = resolve_type(d, rd16(fi));
     const char *type = dex_type(d, rd16(fi + 2)), *name = dex_str(d, rd32(fi + 4));
@@ -1260,7 +1266,7 @@ static fref *resolve_fref(dvm_dex *d, uint32_t idx, bool is_static)
     if (!r->df && !r->missing) r->hf = tl_jni_field(cls, name, type, is_static);
     r->cls = r->df ? r->df->cls->jc : cls;
     pthread_mutex_lock(&g_lock);
-    if (!d->fcache[idx]) __atomic_store_n(&d->fcache[idx], (dvm_field *)r, __ATOMIC_RELEASE); else { free(r); r = (fref *)d->fcache[idx]; }
+    if (!d->fcache[idx]) __atomic_store_n(&d->fcache[idx], (dvm_field *)r, __ATOMIC_RELEASE); else { tl_gc_free(r); r = (fref *)d->fcache[idx]; }
     pthread_mutex_unlock(&g_lock);
     return r;
 }
@@ -2068,6 +2074,8 @@ char g_dvm_boot_path[4096];
 
 bool tl_dvm_start(const char *const *boot, int nboot)
 {
+    tl_gc_init();
+    tl_jni_gc_roots();
     size_t k = 0;
     for (int i = 0; i < nboot && k < sizeof(g_dvm_boot_path); i++)
         k += (size_t)snprintf(g_dvm_boot_path + k, sizeof(g_dvm_boot_path) - k, "%s%s", i ? ":" : "", boot[i]);

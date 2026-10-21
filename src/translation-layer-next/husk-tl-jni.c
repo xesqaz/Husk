@@ -11,6 +11,7 @@
 
 #include "husk-tl-bionic.h"
 #include "husk-tl-dexindex.h"
+#include "husk-tl-gc.h"
 #include "husk-tl-va.h"
 
 /* ---------------------------------------------------------------- types */
@@ -25,10 +26,41 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_trace;
 static const tl_jhle *g_hle[32];
 static int g_nhle;
+static bool g_gc_roots_ready;
+static pthread_mutex_t g_legacy_lock = PTHREAD_MUTEX_INITIALIZER;
+static jobj **g_legacy_objects;
+static size_t g_legacy_count, g_legacy_capacity;
 
 void tl_jni_set_trace(int level) { g_trace = level; }
 
 static uint32_t hash_str(const char *s) { uint32_t h = 2166136261u; while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; } return h; }
+
+static void legacy_track(jobj *o)
+{
+    if (tl_gc_active()) return;
+    pthread_mutex_lock(&g_legacy_lock);
+    if (g_legacy_count == g_legacy_capacity) {
+        size_t cap = g_legacy_capacity ? g_legacy_capacity * 2 : 256;
+        jobj **objects = realloc(g_legacy_objects, cap * sizeof(*objects));
+        if (!objects) { pthread_mutex_unlock(&g_legacy_lock); return; }
+        g_legacy_objects = objects;
+        g_legacy_capacity = cap;
+    }
+    g_legacy_objects[g_legacy_count] = o;
+    o->legacy_root_index = (uint32_t)(g_legacy_count + 1);
+    g_legacy_count++;
+    pthread_mutex_unlock(&g_legacy_lock);
+}
+
+static void legacy_untrack(jobj *o)
+{
+    if (!o || !o->legacy_root_index) return;
+    pthread_mutex_lock(&g_legacy_lock);
+    size_t i = (size_t)o->legacy_root_index - 1;
+    if (i < g_legacy_count && g_legacy_objects[i] == o) g_legacy_objects[i] = NULL;
+    o->legacy_root_index = 0;
+    pthread_mutex_unlock(&g_legacy_lock);
+}
 
 #define TRACE(...) do { if (g_trace >= 1) tl_log_line(__VA_ARGS__); } while (0)
 #define TRACE2(...) do { if (g_trace >= 2) tl_log_line(__VA_ARGS__); } while (0)
@@ -37,10 +69,11 @@ static uint32_t hash_str(const char *s) { uint32_t h = 2166136261u; while (*s) {
 
 static jobj *obj_alloc(uint8_t kind, tl_jclass *cls)
 {
-    jobj *o = calloc(1, sizeof(*o));
+    jobj *o = tl_gc_alloc(sizeof(*o));
     o->refs = 1;
     o->kind = kind;
     o->cls = cls;
+    legacy_track(o);
     return o;
 }
 
@@ -51,8 +84,9 @@ void tl_jni_unref(jobj *o)
     if (!o || o->kind == TL_K_CLASS) return;
     /* With the Java runtime up, objects live as long as Java can reach them, which reference counts from native code do not
      * know about: nothing is freed here (a tracing collector's job). */
-    if (tl_dvm) return;
+    if (tl_gc_active()) return;
     if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_ACQ_REL) != 0) return;
+    legacy_untrack(o);
     switch (o->kind) {
     case TL_K_STRING: free(o->str.utf8); free(o->str.u16); break;
     case TL_K_PRIM_ARRAY: free(o->arr.data); break;
@@ -102,7 +136,7 @@ static tl_jclass *tl_jni_declare_linked(const char *name, const char *super)
     pthread_mutex_lock(&g_lock);
     tl_jclass *c = find_class_locked(name);
     if (!c) {
-        c = calloc(1, sizeof(*c));
+        c = tl_gc_active() ? tl_gc_alloc_uncollectable(sizeof(*c)) : calloc(1, sizeof(*c));
         c->name = strdup(name);
         uint32_t h = hash_str(name) % NBUCKETS;
         c->next = g_classes[h];
@@ -153,7 +187,7 @@ jobj *tl_jni_new_object(tl_jclass *cls)
     jobj *o = obj_alloc(TL_K_OBJECT, cls);
     if (tl_dvm && cls && cls->dvm) {
         uint32_t n = tl_dvm->instance_slots(cls);
-        if (n) { o->fields = calloc(n, sizeof(jvalue)); o->nfields = n; }
+        if (n) { o->fields = tl_gc_alloc((size_t)n * sizeof(jvalue)); o->nfields = n; }
     }
     return o;
 }
@@ -161,7 +195,7 @@ jobj *tl_jni_new_object(tl_jclass *cls)
 jobj *tl_jni_new_string(const char *utf8)
 {
     jobj *o = obj_alloc(TL_K_STRING, tl_jni_class("java/lang/String"));
-    o->str.utf8 = strdup(utf8 ? utf8 : "");
+    o->str.utf8 = tl_gc_strdup(utf8 ? utf8 : "");
     return o;
 }
 
@@ -178,7 +212,7 @@ jobj *tl_jni_new_prim_array(char etype, uint32_t len)
     char cn[4] = { '[', etype, 0 };
     jobj *o = obj_alloc(TL_K_PRIM_ARRAY, tl_jni_class(cn));
     o->arr.esz = esz_of(etype); o->arr.etype = etype; o->arr.len = len;
-    o->arr.data = calloc(len ? len : 1, o->arr.esz);
+    o->arr.data = tl_gc_alloc_atomic((size_t)(len ? len : 1) * o->arr.esz);
     return o;
 }
 
@@ -188,7 +222,7 @@ jobj *tl_jni_new_obj_array(tl_jclass *elem, uint32_t len)
     snprintf(cn, sizeof(cn), "[L%s;", elem ? elem->name : "java/lang/Object");
     jobj *o = obj_alloc(TL_K_OBJ_ARRAY, tl_jni_class(cn));
     o->oarr.len = len;
-    o->oarr.v = calloc(len ? len : 1, sizeof(jobj *));
+    o->oarr.v = tl_gc_alloc((size_t)(len ? len : 1) * sizeof(jobj *));
     return o;
 }
 
@@ -281,12 +315,12 @@ static tl_jmeth *lookup_method(tl_jclass *cls, const char *name, const char *sig
     if (tl_dvm && cls->dvm) {
         void *dm = tl_dvm->find_method(cls, name, sig, is_static);
         if (dm) {
-            tl_jmeth *m = calloc(1, sizeof(*m));
-            m->cls = cls; m->name = strdup(name); m->sig = strdup(sig); m->is_static = is_static;
+            tl_jmeth *m = tl_gc_alloc_uncollectable(sizeof(*m));
+            m->cls = cls; m->name = tl_gc_strdup(name); m->sig = tl_gc_strdup(sig); m->is_static = is_static;
             m->dvm = dm; m->exists = true;
             parse_sig(m);
             pthread_mutex_lock(&g_lock);
-            if (cls->nmeths == cls->capm) { cls->capm = cls->capm ? cls->capm * 2 : 8; cls->meths = realloc(cls->meths, (size_t)cls->capm * sizeof(*cls->meths)); }
+            if (cls->nmeths == cls->capm) { cls->capm = cls->capm ? cls->capm * 2 : 8; cls->meths = tl_gc_realloc(cls->meths, (size_t)cls->capm * sizeof(*cls->meths)); }
             cls->meths[cls->nmeths++] = m;
             pthread_mutex_unlock(&g_lock);
             return m;
@@ -309,12 +343,12 @@ static tl_jmeth *lookup_method(tl_jclass *cls, const char *name, const char *sig
     if (!fn && !dex_decl) for (tl_jclass *c = cls; c; c = c->super) if (c->in_dex && tl_dexidx_method_named(c->name, name)) { dex_other_sig = true; break; }
     bool exists = fn || dex_decl || (framework && !dex_other_sig);
 
-    tl_jmeth *m = calloc(1, sizeof(*m));
-    m->cls = cls; m->name = strdup(name); m->sig = strdup(sig); m->is_static = is_static;
+    tl_jmeth *m = tl_gc_alloc_uncollectable(sizeof(*m));
+    m->cls = cls; m->name = tl_gc_strdup(name); m->sig = tl_gc_strdup(sig); m->is_static = is_static;
     m->fn = fn; m->exists = exists;
     parse_sig(m);
     pthread_mutex_lock(&g_lock);
-    if (cls->nmeths == cls->capm) { cls->capm = cls->capm ? cls->capm * 2 : 8; cls->meths = realloc(cls->meths, (size_t)cls->capm * sizeof(*cls->meths)); }
+    if (cls->nmeths == cls->capm) { cls->capm = cls->capm ? cls->capm * 2 : 8; cls->meths = tl_gc_realloc(cls->meths, (size_t)cls->capm * sizeof(*cls->meths)); }
     cls->meths[cls->nmeths++] = m;
     pthread_mutex_unlock(&g_lock);
     return m;
@@ -338,9 +372,9 @@ static tl_jfield *lookup_field(tl_jclass *cls, const char *name, const char *sig
                 tl_jfield *f = decl->fields[i];
                 if (f->is_static == is_static && f->index == slot && !strcmp(f->name, name)) { pthread_mutex_unlock(&g_lock); return f; }
             }
-            tl_jfield *f = calloc(1, sizeof(*f));
-            f->cls = decl; f->name = strdup(name); f->sig = strdup(sig); f->is_static = is_static; f->index = slot;
-            if (decl->nfields == decl->capf) { decl->capf = decl->capf ? decl->capf * 2 : 8; decl->fields = realloc(decl->fields, (size_t)decl->capf * sizeof(*decl->fields)); }
+            tl_jfield *f = tl_gc_alloc_uncollectable(sizeof(*f));
+            f->cls = decl; f->name = tl_gc_strdup(name); f->sig = tl_gc_strdup(sig); f->is_static = is_static; f->index = slot;
+            if (decl->nfields == decl->capf) { decl->capf = decl->capf ? decl->capf * 2 : 8; decl->fields = tl_gc_realloc(decl->fields, (size_t)decl->capf * sizeof(*decl->fields)); }
             decl->fields[decl->nfields++] = f;
             pthread_mutex_unlock(&g_lock);
             return f;
@@ -353,9 +387,9 @@ static tl_jfield *lookup_field(tl_jclass *cls, const char *name, const char *sig
             tl_jfield *f = cls->fields[i];
             if (f->detached && f->is_static == is_static && !strcmp(f->name, name) && !strcmp(f->sig, sig)) { pthread_mutex_unlock(&g_lock); return f; }
         }
-        tl_jfield *f = calloc(1, sizeof(*f));
-        f->cls = cls; f->name = strdup(name); f->sig = strdup(sig); f->is_static = is_static; f->detached = true;
-        if (cls->nfields == cls->capf) { cls->capf = cls->capf ? cls->capf * 2 : 8; cls->fields = realloc(cls->fields, (size_t)cls->capf * sizeof(*cls->fields)); }
+        tl_jfield *f = tl_gc_alloc_uncollectable(sizeof(*f));
+        f->cls = cls; f->name = tl_gc_strdup(name); f->sig = tl_gc_strdup(sig); f->is_static = is_static; f->detached = true;
+        if (cls->nfields == cls->capf) { cls->capf = cls->capf ? cls->capf * 2 : 8; cls->fields = tl_gc_realloc(cls->fields, (size_t)cls->capf * sizeof(*cls->fields)); }
         cls->fields[cls->nfields++] = f;
         pthread_mutex_unlock(&g_lock);
         tl_log_line("jni: %s has no field %s %s: kept apart from its objects", cls->name, name, sig);
@@ -376,19 +410,19 @@ static tl_jfield *lookup_field(tl_jclass *cls, const char *name, const char *sig
         }
         if (!found) return NULL;
     }
-    tl_jfield *f = calloc(1, sizeof(*f));
-    f->cls = cls; f->name = strdup(name); f->sig = strdup(sig); f->is_static = is_static;
+    tl_jfield *f = tl_gc_alloc_uncollectable(sizeof(*f));
+    f->cls = cls; f->name = tl_gc_strdup(name); f->sig = tl_gc_strdup(sig); f->is_static = is_static;
     pthread_mutex_lock(&g_lock);
     f->index = (uint32_t)(is_static ? cls->nstatics++ : cls->nfields - 0);
     if (is_static) {
-        cls->statics = realloc(cls->statics, (size_t)cls->nstatics * sizeof(jvalue));
+        cls->statics = tl_gc_realloc(cls->statics, (size_t)cls->nstatics * sizeof(jvalue));
         memset(&cls->statics[cls->nstatics - 1], 0, sizeof(jvalue));
     } else {
         uint32_t ni = 0;
         for (int i = 0; i < cls->nfields; i++) if (!cls->fields[i]->is_static) ni++;
         f->index = ni;
     }
-    if (cls->nfields == cls->capf) { cls->capf = cls->capf ? cls->capf * 2 : 8; cls->fields = realloc(cls->fields, (size_t)cls->capf * sizeof(*cls->fields)); }
+    if (cls->nfields == cls->capf) { cls->capf = cls->capf ? cls->capf * 2 : 8; cls->fields = tl_gc_realloc(cls->fields, (size_t)cls->capf * sizeof(*cls->fields)); }
     cls->fields[cls->nfields++] = f;
     pthread_mutex_unlock(&g_lock);
     return f;
@@ -410,7 +444,7 @@ static jvalue *field_slot(jobj *o, tl_jfield *f)
     }
     if (f->index >= o->nfields) {
         uint32_t n = f->index + 8;
-        o->fields = realloc(o->fields, n * sizeof(jvalue));
+        o->fields = tl_gc_realloc(o->fields, n * sizeof(jvalue));
         memset(o->fields + o->nfields, 0, (n - o->nfields) * sizeof(jvalue));
         o->nfields = n;
     }
@@ -457,12 +491,13 @@ void tl_jni_throw(const char *cls, const char *msg)
     jvalue v; v.l = tl_jni_new_string(msg ? msg : "");
     tl_jni_set_field(e, "detailMessage", "Ljava/lang/String;", v);
     t_pending = e;
+    tl_gc_set_pending(e);
     tl_log_line("jni: throwing %s: %s", cls, msg ? msg : "");
 }
 bool tl_jni_pending(void) { return t_pending != NULL; }
 jobj *tl_jni_pending_object(void) { return t_pending; }
-void tl_jni_set_pending(jobj *e) { t_pending = e; }
-void tl_jni_clear(void) { t_pending = NULL; }
+void tl_jni_set_pending(jobj *e) { t_pending = e; tl_gc_set_pending(e); }
+void tl_jni_clear(void) { t_pending = NULL; tl_gc_set_pending(NULL); }
 
 /* --------------------------------------------------------------- calling */
 
@@ -545,9 +580,9 @@ static bool string_init_in_place(jobj *self, tl_jmeth *m, const jvalue *args)
     if (!dvm_string_init(m->sig, args, &r) || !r.l) return true;           /* the exception is pending */
     jobj *str = r.l;
     self->kind = TL_K_STRING; self->cls = str->cls;
-    self->str.utf8 = strdup(str->str.utf8 ? str->str.utf8 : "");
+    self->str.utf8 = tl_gc_strdup(str->str.utf8 ? str->str.utf8 : "");
     self->str.len16 = str->str.len16; self->str.u16 = NULL;
-    if (str->str.u16) { self->str.u16 = malloc((size_t)str->str.len16 * 2 + 2); memcpy(self->str.u16, str->str.u16, (size_t)str->str.len16 * 2); self->str.u16[str->str.len16] = 0; }
+    if (str->str.u16) { self->str.u16 = tl_gc_alloc_atomic((size_t)str->str.len16 * 2 + 2); memcpy(self->str.u16, str->str.u16, (size_t)str->str.len16 * 2); self->str.u16[str->str.len16] = 0; }
     tl_jni_unref(str);
     return true;
 }
@@ -634,7 +669,7 @@ static uint8_t jni_IsInstanceOf(void *env, jo obj, jo cls)
     return assignable(oc, cls->klass.jc);
 }
 
-static int32_t jni_Throw(void *env, jo t) { (void)env; t_pending = t; return 0; }
+static int32_t jni_Throw(void *env, jo t) { (void)env; t_pending = t; tl_gc_set_pending(t); return 0; }
 static int32_t jni_ThrowNew(void *env, jo cls, const char *msg) { (void)env; tl_jni_throw(cls && cls->kind == TL_K_CLASS ? cls->klass.jc->name : "java/lang/Error", msg); return 0; }
 static void jni_ExceptionDescribe(void *env);
 static jo jni_ExceptionOccurred(void *env)
@@ -650,12 +685,12 @@ static void jni_ExceptionDescribe(void *env)
     jvalue m = tl_jni_get_field(t_pending, "detailMessage", "Ljava/lang/String;");
     tl_log_line("jni: pending exception %s: %s", t_pending->cls->name, tl_jni_string(m.l) ? tl_jni_string(m.l) : "");
 }
-static void jni_ExceptionClear(void *env) { if (t_pending && g_trace >= 2) { tl_log_line("jni: ExceptionClear of:"); jni_ExceptionDescribe(env); } t_pending = NULL; }
+static void jni_ExceptionClear(void *env) { if (t_pending && g_trace >= 2) { tl_log_line("jni: ExceptionClear of:"); jni_ExceptionDescribe(env); } t_pending = NULL; tl_gc_set_pending(NULL); }
 static void jni_FatalError(void *env, const char *msg) { (void)env; tl_log_line("jni: FatalError: %s", msg); abort(); }
 static int32_t jni_PushLocalFrame(void *env, int32_t cap) { (void)env; (void)cap; return 0; }
 static jo jni_PopLocalFrame(void *env, jo r) { (void)env; return r; }
-static jo jni_NewGlobalRef(void *env, jo o) { (void)env; return tl_jni_ref(o); }
-static void jni_DeleteGlobalRef(void *env, jo o) { (void)env; tl_jni_unref(o); }
+static jo jni_NewGlobalRef(void *env, jo o) { (void)env; tl_gc_global_ref_add(o); return tl_jni_ref(o); }
+static void jni_DeleteGlobalRef(void *env, jo o) { (void)env; tl_gc_global_ref_remove(o); tl_jni_unref(o); }
 static void jni_DeleteLocalRef(void *env, jo o) { (void)env; tl_jni_unref(o); }
 static uint8_t jni_IsSameObject(void *env, jo a, jo b) { (void)env; return a == b; }
 static jo jni_NewLocalRef(void *env, jo o) { (void)env; return tl_jni_ref(o); }
@@ -1202,6 +1237,55 @@ void tl_jni_each_declared(void (*fn)(tl_jclass *jc))
     pthread_mutex_unlock(&g_lock);
     for (int i = 0; i < n; i++) fn(list[i]);
     free(list);
+}
+
+static void *gc_copy_uncollectable(void *old, size_t size)
+{
+    if (!old || !size) return old;
+    void *copy = tl_gc_alloc_uncollectable(size);
+    if (!copy) return old;
+    memcpy(copy, old, size);
+    free(old);
+    return copy;
+}
+
+void tl_jni_gc_roots(void)
+{
+    if (!tl_gc_active() || g_gc_roots_ready) return;
+    pthread_mutex_lock(&g_lock);
+    for (int b = 0; b < NBUCKETS; b++) for (tl_jclass *c = g_classes[b]; c; c = c->next) {
+        /* These class records predate the collector and live in ordinary malloc memory. */
+        tl_gc_add_roots(c, (char *)c + sizeof(*c));
+
+        if (c->statics) c->statics = gc_copy_uncollectable(c->statics, (size_t)c->nstatics * sizeof(*c->statics));
+        if (c->meths) {
+            tl_jmeth **methods = gc_copy_uncollectable(c->meths, (size_t)c->capm * sizeof(*c->meths));
+            c->meths = methods;
+            for (int i = 0; i < c->nmeths; i++) c->meths[i] = gc_copy_uncollectable(c->meths[i], sizeof(*c->meths[i]));
+        }
+        if (c->fields) {
+            tl_jfield **fields = gc_copy_uncollectable(c->fields, (size_t)c->capf * sizeof(*c->fields));
+            c->fields = fields;
+            for (int i = 0; i < c->nfields; i++) c->fields[i] = gc_copy_uncollectable(c->fields[i], sizeof(*c->fields[i]));
+        }
+    }
+    g_gc_roots_ready = true;
+    pthread_mutex_unlock(&g_lock);
+
+    pthread_mutex_lock(&g_legacy_lock);
+    for (size_t i = 0; i < g_legacy_count; i++) {
+        jobj *o = g_legacy_objects[i];
+        if (!o) continue;
+        tl_gc_add_roots(o, (char *)o + sizeof(*o));
+        if (o->fields) o->fields = gc_copy_uncollectable(o->fields, (size_t)o->nfields * sizeof(*o->fields));
+        if (o->kind == TL_K_OBJ_ARRAY && o->oarr.v)
+            o->oarr.v = gc_copy_uncollectable(o->oarr.v, (size_t)(o->oarr.len ? o->oarr.len : 1) * sizeof(*o->oarr.v));
+        o->legacy_root_index = 0;
+    }
+    free(g_legacy_objects);
+    g_legacy_objects = NULL;
+    g_legacy_count = g_legacy_capacity = 0;
+    pthread_mutex_unlock(&g_legacy_lock);
 }
 
 tl_jclass *tl_jni_find_declared(const char *name)

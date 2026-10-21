@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-gc.h"
 
 #define MAX_AXES 48
 #define DEVICE_BASE 41                    /* Android device ids of the controllers: 41, 42, ... */
@@ -195,7 +196,7 @@ static jobj *make_range(int axis)
     float lo, hi;
     if (!axis_range(axis, &lo, &hi)) return NULL;
     jobj *r = tl_jni_new_object(tl_jni_class("android/view/InputDevice$MotionRange"));
-    mrange *m = calloc(1, sizeof(*m));
+    mrange *m = tl_gc_alloc(sizeof(*m));
     m->axis = axis; m->source = SOURCE_GAMEPAD_STICKS; m->lo = lo; m->hi = hi; m->flat = (axis >= AXIS_HAT_X && axis <= AXIS_HAT_Y) ? 0.0f : 0.08f;
     r->native = m;
     return r;
@@ -208,8 +209,8 @@ static void ID_getMotionRanges(tl_jcall *c)
 {
     static const int axes[] = { AXIS_X, AXIS_Y, AXIS_Z, AXIS_RZ, AXIS_HAT_X, AXIS_HAT_Y, AXIS_LTRIGGER, AXIS_RTRIGGER, AXIS_GAS, AXIS_BRAKE };
     jobj *l = tl_jni_new_object(tl_jni_class("java/util/ArrayList"));
-    alist *a = calloc(1, sizeof(*a));
-    a->items = calloc(sizeof(axes) / sizeof(axes[0]), sizeof(jobj *));
+    alist *a = tl_gc_alloc(sizeof(*a));
+    a->items = tl_gc_alloc(sizeof(axes) / sizeof(axes[0]) * sizeof(jobj *));
     for (size_t i = 0; i < sizeof(axes) / sizeof(axes[0]); i++) if ((a->items[a->n] = make_range(axes[i]))) a->n++;
     l->native = a;
     c->ret = vl(l);

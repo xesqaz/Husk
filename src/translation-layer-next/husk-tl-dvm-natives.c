@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-gc.h"
 #include "husk-tl-internal.h"
 #include <strings.h>
 
@@ -50,7 +51,7 @@ NAT(Object_internalClone)
         int32_t n; const uint16_t *s = chars(self, &n); c = tl_dvm_string_u16(s, n);
     } else {
         c = dvm_new_object(self->cls);
-        if (self->nfields) { c->fields = calloc(self->nfields, sizeof(jvalue)); memcpy(c->fields, self->fields, self->nfields * sizeof(jvalue)); c->nfields = self->nfields; }
+        if (self->nfields) { c->fields = tl_gc_alloc((size_t)self->nfields * sizeof(jvalue)); memcpy(c->fields, self->fields, self->nfields * sizeof(jvalue)); c->nfields = self->nfields; }
     }
     c->refs = 1u << 30;
     *ret = L(c);
@@ -152,33 +153,58 @@ static jobj **g_interned;                 /* open addressing, kept at most half 
 static uint32_t g_icap, g_icount;
 static pthread_mutex_t g_intern_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t str_hash(const uint16_t *s, int32_t n) { uint32_t h = 0; for (int32_t i = 0; i < n; i++) h = h * 31 + s[i]; return h; }
+
+static bool intern_resize(uint32_t cap)
+{
+    jobj **table = tl_gc_alloc_uncollectable((size_t)cap * sizeof(*table));
+    if (!table) return false;
+    for (uint32_t i = 0; i < g_icap; i++) {
+        jobj *o = g_interned[i];
+        if (!o) continue;
+        tl_gc_weak_ref_remove((void **)&g_interned[i]);
+        int32_t n; const uint16_t *s = chars(o, &n);
+        uint32_t k = str_hash(s, n) & (cap - 1);
+        while (table[k]) k = (k + 1) & (cap - 1);
+        table[k] = o;
+        (void)tl_gc_weak_ref_register((void **)&table[k], o);
+    }
+    tl_gc_free(g_interned);
+    g_interned = table;
+    g_icap = cap;
+    return true;
+}
+
 NAT(String_intern)
 {
     (void)a;
     int32_t n; const uint16_t *s = chars(self, &n);
     uint32_t h = str_hash(s, n);
     pthread_mutex_lock(&g_intern_lock);
+    if (!g_icap && !intern_resize(65536)) { pthread_mutex_unlock(&g_intern_lock); *ret = L(self); return true; }
     if ((g_icount + 1) * 2 > g_icap) {
-        uint32_t cap = g_icap ? g_icap * 2 : 65536;
-        jobj **t = calloc(cap, sizeof(*t));
-        for (uint32_t i = 0; i < g_icap; i++) {
-            jobj *o = g_interned[i];
-            if (!o) continue;
-            int32_t m; const uint16_t *u = chars(o, &m);
-            uint32_t k = str_hash(u, m) & (cap - 1);
-            while (t[k]) k = (k + 1) & (cap - 1);
-            t[k] = o;
+        g_icount = 0;
+        for (uint32_t i = 0; i < g_icap; i++) if (g_interned[i]) g_icount++;
+        if ((g_icount + 1) * 2 > g_icap && !intern_resize(g_icap * 2)) {
+            pthread_mutex_unlock(&g_intern_lock); *ret = L(self); return true;
         }
-        free(g_interned);
-        g_interned = t; g_icap = cap;
     }
     *ret = L(self);
-    for (uint32_t k = h & (g_icap - 1);; k = (k + 1) & (g_icap - 1)) {
+    uint32_t empty = UINT32_MAX;
+    for (uint32_t probe = 0; probe < g_icap; probe++) {
+        uint32_t k = (h + probe) & (g_icap - 1);
         jobj *o = g_interned[k];
-        if (!o) { g_interned[k] = self; self->refs = 1u << 30; g_icount++; break; }
+        if (!o) { if (empty == UINT32_MAX) empty = k; continue; }
         int32_t m; const uint16_t *t = chars(o, &m);
-        if (m == n && !memcmp(s, t, (size_t)n * 2)) { *ret = L(o); break; }
+        if (m == n && !memcmp(s, t, (size_t)n * 2)) { *ret = L(o); pthread_mutex_unlock(&g_intern_lock); return true; }
     }
+    if (empty == UINT32_MAX) {
+        if (!intern_resize(g_icap * 2)) { pthread_mutex_unlock(&g_intern_lock); return true; }
+        empty = h & (g_icap - 1);
+        while (g_interned[empty]) empty = (empty + 1) & (g_icap - 1);
+    }
+    g_interned[empty] = self;
+    (void)tl_gc_weak_ref_register((void **)&g_interned[empty], self);
+    g_icount++;
     pthread_mutex_unlock(&g_intern_lock);
     return true;
 }
@@ -572,6 +598,7 @@ jobj *dvm_current_thread(void)
     jobj *t = dvm_new_object(tc);
     dvm_slots(t);
     t_thread = t;
+    tl_gc_set_current_thread(t);
     pthread_mutex_lock(&g_tid_lock);
     pthread_mutex_unlock(&g_tid_lock);
     dvm_class *tg = dvm_class_of(dvm_class_named("java/lang/ThreadGroup"));
@@ -704,7 +731,9 @@ static void *thread_main(void *p)
     void tl_thread_altstack(void); tl_thread_altstack();
     start_arg *s = p;
     t_thread = s->thread;
-    free(s);
+    tl_gc_set_current_thread(t_thread);
+    tl_gc_global_ref_remove(t_thread);
+    tl_gc_free(s);
     jobj *t = t_thread;
     jvalue nm; dvm_class *c = dvm_class_of(dvm_object_class(t));
     dvm_field *nf = c ? dvm_find_field(c, "name", false) : NULL;
@@ -745,20 +774,23 @@ static void *thread_main(void *p)
     if (!lf) { dvm_class *tc = dvm_class_of(dvm_class_named("java/lang/Thread")); lf = tc ? dvm_find_field(tc, "lock", false) : NULL; }
     jobj *lk = lf ? dvm_slots(t)[lf->slot].l : NULL;
     if (lk) { dvm_monitor_enter(lk); dvm_monitor_notify(lk, true); dvm_monitor_exit(lk); }
+    tl_gc_set_current_thread(NULL);
+    t_thread = NULL;
     return NULL;
 }
 NAT(Thread_nativeCreate)
 {
     (void)self; (void)ret;
-    start_arg *s = malloc(sizeof(*s));
+    start_arg *s = tl_gc_alloc_uncollectable(sizeof(*s));
     s->thread = a[0].l;
+    tl_gc_global_ref_add(s->thread);
     dvm_field *pf = s->thread ? thread_peer(s->thread) : NULL;
     if (pf) dvm_slots(s->thread)[pf->slot].j = (int64_t)(uintptr_t)s->thread;     /* alive from here (before it runs: start() then isAlive() is true) */
     pthread_attr_t at; pthread_attr_init(&at);
     pthread_attr_setstacksize(&at, 32u << 20);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_t th;
-    if (pthread_create(&th, &at, thread_main, s) != 0) { free(s); return dvm_throw("java/lang/OutOfMemoryError", "pthread_create"); }
+    if (pthread_create(&th, &at, thread_main, s) != 0) { tl_gc_global_ref_remove(s->thread); tl_gc_free(s); return dvm_throw("java/lang/OutOfMemoryError", "pthread_create"); }
     return true;
 }
 
@@ -821,9 +853,10 @@ NAT(Throwable_getStack)
 
 /* ================================================================== Runtime */
 
-NAT(Runtime_freeMemory) { UNUSED; *ret = J(256ll << 20); return true; }
-NAT(Runtime_maxMemory) { UNUSED; *ret = J(512ll << 20); return true; }
-NAT(Runtime_gc) { UNUSED; return true; }
+NAT(Runtime_freeMemory) { UNUSED; *ret = J(tl_gc_free_bytes()); return true; }
+NAT(Runtime_totalMemory) { UNUSED; *ret = J(tl_gc_total_bytes()); return true; }
+NAT(Runtime_maxMemory) { UNUSED; *ret = J(tl_gc_process_limit()); return true; }
+NAT(Runtime_gc) { UNUSED; tl_gc_collect(); return true; }
 NAT(Runtime_exit) { (void)self; (void)ret; tl_log_line("dvm: Runtime.exit(%d)", a[0].i); _exit(a[0].i); }
 NAT(Runtime_nativeLoad)
 {
@@ -1937,7 +1970,7 @@ static const entry k_natives[] = {
     { "java/lang/Throwable", "nativeGetStackTrace", "(Ljava/lang/Object;)[Ljava/lang/StackTraceElement;", Throwable_getStack },
 
     { "java/lang/Runtime", "freeMemory", "()J", Runtime_freeMemory },
-    { "java/lang/Runtime", "totalMemory", "()J", Runtime_maxMemory },
+    { "java/lang/Runtime", "totalMemory", "()J", Runtime_totalMemory },
     { "java/lang/Runtime", "maxMemory", "()J", Runtime_maxMemory },
     { "java/lang/Runtime", "nativeGc", "()V", Runtime_gc },
     { "java/lang/Runtime", "nativeExit", "(I)V", Runtime_exit },

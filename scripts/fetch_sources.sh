@@ -15,6 +15,12 @@ fetch() {
     mv "$file.part" "$file"
 }
 
+verify_bdwgc() {
+    local file="$DL/$(basename "$BDWGC_SRC")"
+    [ -s "$file" ] || return 1
+    printf '%s  %s\n' "$BDWGC_SHA256" "$file" | shasum -a 256 -c - >/dev/null
+}
+
 unpack() {
     local file="$DL/$(basename "$1")" stamp
     stamp="$SRC/.unpacked-$(basename "$file")"
@@ -25,10 +31,11 @@ unpack() {
 }
 
 rc=0
-for u in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$PIXMAN_SRC" "$SLIRP_SRC" "$QEMU_SRC"; do
+for u in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$PIXMAN_SRC" "$SLIRP_SRC" "$QEMU_SRC" "$BDWGC_SRC"; do
     fetch "$u" || rc=1
 done
-for u in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$PIXMAN_SRC" "$SLIRP_SRC" "$QEMU_SRC"; do
+verify_bdwgc || { echo "[FAIL] BDWGC archive checksum mismatch"; rc=1; }
+for u in "$FFI_SRC" "$ICONV_SRC" "$GETTEXT_SRC" "$GLIB_SRC" "$PIXMAN_SRC" "$SLIRP_SRC" "$QEMU_SRC" "$BDWGC_SRC"; do
     unpack "$u" || rc=1
 done
 

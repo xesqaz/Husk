@@ -77,5 +77,6 @@ tl_jfield *tl_jni_field(tl_jclass *cls, const char *name, const char *sig, bool 
 jvalue *tl_jni_field_slot(jobj *o, tl_jfield *f);
 tl_jclass *tl_jni_find_declared(const char *name);   /* already declared, or NULL */
 void tl_jni_each_declared(void (*fn)(tl_jclass *jc));
+void tl_jni_gc_roots(void);
 
 #endif

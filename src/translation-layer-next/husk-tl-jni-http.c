@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-gc.h"
 #include "husk-tl-http.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -30,7 +31,7 @@ static const char *S(const jobj *o) { const char *s = tl_jni_string(o); return s
 /* ------------------------------------------------------------------ HashMap */
 
 typedef struct { jobj **k, **v; int n, cap; } hmap;
-static hmap *HM(jobj *o) { if (!o->native) o->native = calloc(1, sizeof(hmap)); return o->native; }
+static hmap *HM(jobj *o) { if (!o->native) o->native = tl_gc_alloc(sizeof(hmap)); return o->native; }
 
 static void Map_init(tl_jcall *c) { (void)HM(c->self); }
 static void Map_put(tl_jcall *c)
@@ -40,7 +41,7 @@ static void Map_put(tl_jcall *c)
     for (int i = 0; i < m->n; i++) {
         if (!strcmp(S(m->k[i]), key)) { jobj *old = m->v[i]; m->v[i] = c->args[1].l ? tl_jni_ref(c->args[1].l) : NULL; c->ret = vl(old); return; }
     }
-    if (m->n == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->k = realloc(m->k, (size_t)m->cap * sizeof(jobj *)); m->v = realloc(m->v, (size_t)m->cap * sizeof(jobj *)); }
+    if (m->n == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->k = tl_gc_realloc(m->k, (size_t)m->cap * sizeof(jobj *)); m->v = tl_gc_realloc(m->v, (size_t)m->cap * sizeof(jobj *)); }
     m->k[m->n] = c->args[0].l ? tl_jni_ref(c->args[0].l) : NULL;
     m->v[m->n] = c->args[1].l ? tl_jni_ref(c->args[1].l) : NULL;
     m->n++;
@@ -69,16 +70,16 @@ static void Map_entrySet(tl_jcall *c) { c->ret = vl(tl_jni_new_object(tl_jni_cla
 #define CLS "com/unity3d/player/UnityWebRequest"
 
 typedef struct { int64_t ptr; char *url, *method; jobj *headers; int timeout_ms; int64_t upload_len; bool expect, chunked; } uwr;
-static uwr *U(jobj *o) { if (!o->native) o->native = calloc(1, sizeof(uwr)); return o->native; }
+static uwr *U(jobj *o) { if (!o->native) o->native = tl_gc_alloc(sizeof(uwr)); return o->native; }
 
 static void UWR_init(tl_jcall *c)
 {
     /* (long nativeRequest, String method, Map headers, String url, boolean certificateHandler, int timeoutMs) */
     uwr *u = U(c->self);
     u->ptr = c->args[0].j;
-    u->method = strdup(S(c->args[1].l));
+    u->method = tl_gc_strdup(S(c->args[1].l));
     u->headers = c->args[2].l ? tl_jni_ref(c->args[2].l) : NULL;
-    u->url = strdup(S(c->args[3].l));
+    u->url = tl_gc_strdup(S(c->args[3].l));
     u->timeout_ms = c->args[5].i;
 }
 static void UWR_setup(tl_jcall *c)
@@ -226,8 +227,8 @@ static void LP_dnsServers(tl_jcall *c)
     char servers[6][64];
     int n = tl_dns_servers(servers, 6);
     jobj *l = tl_jni_new_object(tl_jni_class("java/util/ArrayList"));
-    alist *a = calloc(1, sizeof(*a));
-    a->items = calloc((size_t)n, sizeof(jobj *));
+    alist *a = tl_gc_alloc(sizeof(*a));
+    a->items = tl_gc_alloc((size_t)(n ? n : 1) * sizeof(jobj *));
     for (int i = 0; i < n; i++) {
         jobj *ia = tl_jni_new_object(tl_jni_class("java/net/InetAddress"));
         jvalue v; v.j = 0; v.l = tl_jni_new_string(servers[i]);
@@ -284,23 +285,23 @@ static void *x_native(const char *cls, const char *name, const char *sig, const 
 typedef struct { char *url, *method, *ctype; char **hn, **hv; int nh, cap; int64_t call, clen; } xreq;
 typedef struct { int64_t call; tl_http_response rs; } xres;
 
-static xreq *XQ(jobj *o) { if (!o->native) o->native = calloc(1, sizeof(xreq)); return o->native; }
+static xreq *XQ(jobj *o) { if (!o->native) o->native = tl_gc_alloc(sizeof(xreq)); return o->native; }
 
 static void XReq_init(tl_jcall *c) { (void)XQ(c->self); }
-static void XReq_url(tl_jcall *c) { xreq *q = XQ(c->self); free(q->url); q->url = strdup(S(c->args[0].l)); }
+static void XReq_url(tl_jcall *c) { xreq *q = XQ(c->self); tl_gc_free(q->url); q->url = tl_gc_strdup(S(c->args[0].l)); }
 static void XReq_header(tl_jcall *c)
 {
     xreq *q = XQ(c->self);
-    if (q->nh == q->cap) { q->cap = q->cap ? q->cap * 2 : 8; q->hn = realloc(q->hn, (size_t)q->cap * sizeof(char *)); q->hv = realloc(q->hv, (size_t)q->cap * sizeof(char *)); }
-    q->hn[q->nh] = strdup(S(c->args[0].l)); q->hv[q->nh] = strdup(S(c->args[1].l)); q->nh++;
+    if (q->nh == q->cap) { q->cap = q->cap ? q->cap * 2 : 8; q->hn = tl_gc_realloc(q->hn, (size_t)q->cap * sizeof(char *)); q->hv = tl_gc_realloc(q->hv, (size_t)q->cap * sizeof(char *)); }
+    q->hn[q->nh] = tl_gc_strdup(S(c->args[0].l)); q->hv[q->nh] = tl_gc_strdup(S(c->args[1].l)); q->nh++;
 }
 static void XReq_methodAndBody(tl_jcall *c)
 {
     /* (String method, long call, String contentType, long contentLength) */
     xreq *q = XQ(c->self);
-    free(q->method); q->method = strdup(S(c->args[0].l));
+    tl_gc_free(q->method); q->method = tl_gc_strdup(S(c->args[0].l));
     q->call = c->args[1].j;
-    free(q->ctype); q->ctype = c->args[2].l ? strdup(S(c->args[2].l)) : NULL;
+    tl_gc_free(q->ctype); q->ctype = c->args[2].l ? tl_gc_strdup(S(c->args[2].l)) : NULL;
     q->clen = c->args[3].j;
 }
 
@@ -337,7 +338,7 @@ static void XReq_do(tl_jcall *c)
 
     tl_http_request rq = { .url = q->url, .method = q->method, .nheaders = q->nh, .header_names = (const char *const *)q->hn,
                            .header_values = (const char *const *)q->hv, .body = body, .body_len = body_len, .timeout_ms = 60000, .follow_redirects = true };
-    xres *res = calloc(1, sizeof(*res));
+    xres *res = tl_gc_alloc(sizeof(*res));
     res->call = call;
     tl_log_line("http: %s %s (%zu bytes sent)", q->method ? q->method : "GET", q->url ? q->url : "", body_len);
     if (!tl_http_perform(&rq, &res->rs)) {
@@ -347,7 +348,7 @@ static void XReq_do(tl_jcall *c)
         jobj *a = tl_jni_new_string(cls), *b = tl_jni_new_string(res->rs.message), *n = tl_jni_new_string("Has active network: true");
         fail(env, self, call, a, b, n, res->rs.error == TL_HTTP_UNKNOWN_HOST);
         tl_jni_unref(a); tl_jni_unref(b); tl_jni_unref(n);
-        tl_http_response_free(&res->rs); free(res);
+        tl_http_response_free(&res->rs); tl_gc_free(res);
     } else {
         tl_log_line("http: %s -> %d (%zu bytes)", q->url ? q->url : "", res->rs.status, res->rs.body_len);
         jobj *r = tl_jni_new_object(tl_jni_class(XRES));

@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-gc.h"
 
 static jvalue vl(void *p) { jvalue v; v.j = 0; v.l = p; return v; }
 static jvalue vz(int z) { jvalue v; v.j = 0; v.z = z != 0; return v; }
@@ -128,7 +129,7 @@ static void Key_getAlgorithm(tl_jcall *c) { c->ret = vl(STR("RSA")); }
 
 /* Signature: the message is gathered by update(), verified by verify() */
 typedef struct { uint8_t *msg; size_t n, cap; jobj *key; char algo[40]; } sigstate;
-static sigstate *sig_of(jobj *o) { if (!o->native) o->native = calloc(1, sizeof(sigstate)); return o->native; }
+static sigstate *sig_of(jobj *o) { if (!o->native) o->native = tl_gc_alloc(sizeof(sigstate)); return o->native; }
 static void Signature_getInstance(tl_jcall *c)
 {
     jobj *s = tl_jni_new_object(tl_jni_class("java/security/Signature"));
@@ -138,7 +139,7 @@ static void Signature_getInstance(tl_jcall *c)
 static void Signature_initVerify(tl_jcall *c) { sigstate *st = sig_of(c->self); st->key = c->args[0].l; st->n = 0; }
 static void sig_add(sigstate *st, const uint8_t *p, size_t n)
 {
-    if (st->n + n > st->cap) { st->cap = (st->n + n) * 2; st->msg = realloc(st->msg, st->cap); }
+    if (st->n + n > st->cap) { st->cap = (st->n + n) * 2; st->msg = tl_gc_realloc_atomic(st->msg, st->cap); }
     memcpy(st->msg + st->n, p, n); st->n += n;
 }
 static void Signature_update(tl_jcall *c) { jobj *a = c->args[0].l; if (a) sig_add(sig_of(c->self), a->arr.data, a->arr.len); }
@@ -232,7 +233,7 @@ static jobj *uuid_new(uint64_t msb, uint64_t lsb)
     uuid_state *u = calloc(1, sizeof(*u)); u->msb = msb; u->lsb = lsb; o->native = u;
     return o;
 }
-static uuid_state *uuid_of(jobj *o) { if (!o->native) o->native = calloc(1, sizeof(uuid_state)); return o->native; }
+static uuid_state *uuid_of(jobj *o) { if (!o->native) o->native = tl_gc_alloc(sizeof(uuid_state)); return o->native; }
 static void UUID_randomUUID(tl_jcall *c)
 {
     uint64_t r[2]; arc4random_buf(r, sizeof(r));

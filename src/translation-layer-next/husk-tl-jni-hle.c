@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-gc.h"
 #include "husk-tl-internal.h"
 #include "husk-tl-ld.h"
 #include "husk-tl-dexindex.h"
@@ -707,8 +708,8 @@ static void Iterator_next(tl_jcall *c)
 jobj *tl_jni_new_list_iterator(jobj *const *items, uint32_t n)
 {
     jobj *o = make("java/util/Iterator");
-    list_iter *it = calloc(1, sizeof(*it));
-    it->items = malloc((n ? n : 1) * sizeof(jobj *));
+    list_iter *it = tl_gc_alloc(sizeof(*it));
+    it->items = tl_gc_alloc((size_t)(n ? n : 1) * sizeof(jobj *));
     for (uint32_t i = 0; i < n; i++) it->items[i] = tl_jni_ref(items[i]);
     it->n = n;
     o->native = it;
@@ -719,10 +720,10 @@ jobj *tl_jni_new_list_iterator(jobj *const *items, uint32_t n)
 /* ------------------------------------------------ strings and builders */
 
 typedef struct { char *p; size_t n, cap; } sbuf;
-static sbuf *sb_of(jobj *o) { if (!o->native) o->native = calloc(1, sizeof(sbuf)); return o->native; }
+static sbuf *sb_of(jobj *o) { if (!o->native) o->native = tl_gc_alloc(sizeof(sbuf)); return o->native; }
 static void sb_add(sbuf *b, const char *s, size_t n)
 {
-    if (b->n + n + 1 > b->cap) { b->cap = (b->n + n + 1) * 2; b->p = realloc(b->p, b->cap); }
+    if (b->n + n + 1 > b->cap) { b->cap = (b->n + n + 1) * 2; b->p = tl_gc_realloc_atomic(b->p, b->cap); }
     memcpy(b->p + b->n, s, n); b->n += n; b->p[b->n] = 0;
 }
 
@@ -783,7 +784,7 @@ static void SB_setLength(tl_jcall *c) { sbuf *b = sb_of(c->self); if (c->args[0]
 
 /* ------------------------------------------ assets, streams, Scanner */
 
-typedef struct { const uint8_t *data; size_t len, pos; uint8_t *owned; } stream;
+typedef struct { const uint8_t *data; size_t len, pos; } stream;
 
 static jobj *open_asset(const char *name)
 {
@@ -795,9 +796,17 @@ static jobj *open_asset(const char *name)
         if (!e) continue;
         const uint8_t *d; size_t n; bool owned; char err[160];
         if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &n, &owned, err, sizeof(err))) return NULL;
+        stream *st = tl_gc_alloc(sizeof(*st));
+        if (!st) { if (owned) free((void *)d); return NULL; }
+        if (owned) {
+            uint8_t *copy = tl_gc_alloc_atomic(n);
+            if (!copy) { free((void *)d); return NULL; }
+            memcpy(copy, d, n);
+            free((void *)d);
+            d = copy;
+        }
         jobj *s = make("java/io/ByteArrayInputStream");
-        stream *st = calloc(1, sizeof(*st));
-        st->data = d; st->len = n; if (owned) st->owned = (uint8_t *)d;
+        st->data = d; st->len = n;
         s->native = st;
         return s;
     }
@@ -824,7 +833,7 @@ static void IS_read_range(tl_jcall *c)
     memcpy((char *)a->arr.data + off, s->data + s->pos, n); s->pos += n; c->ret = vi((int)n);
 }
 static void IS_available(tl_jcall *c) { stream *s = c->self->native; c->ret = vi(s ? (int)(s->len - s->pos) : 0); }
-static void IS_close(tl_jcall *c) { (void)c; }
+static void IS_close(tl_jcall *c) { if (c->self) c->self->native = NULL; }
 static void Scanner_init(tl_jcall *c) { tl_jni_set_field(c->self, "stream", "Ljava/io/InputStream;", vl(tl_jni_ref(c->args[0].l))); }
 static void Scanner_useDelimiter(tl_jcall *c) { c->ret = vl(tl_jni_ref(c->self)); }
 static void Scanner_hasNext(tl_jcall *c)

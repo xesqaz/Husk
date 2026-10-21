@@ -81,7 +81,11 @@ targets:
         LIBRARY_SEARCH_PATHS:
           - "$(inherited)"
           - "$(SRCROOT)/../../build/ios-arm64/lib"
+          - "$(SRCROOT)/../../build/ios-arm64/sysroot/lib"
           - "$(SRCROOT)/Frameworks"
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../../build/ios-arm64/sysroot/include"
         # zlib, for the translation layer's APK reader. Part of the iOS SDK. AudioToolbox is the sound a
         # cocos2d-x game's mixer plays through; CoreText and CoreGraphics draw its text labels.
         OTHER_LDFLAGS:
@@ -91,6 +95,8 @@ targets:
           - "-lresolv"
           # SQLite for Java apps' android.database.sqlite (the system's own library).
           - "-lsqlite3"
+          # BDWGC reclaims unreachable Java objects from the embedded DVM.
+          - "-lgc"
           - "-framework"
           - "AudioToolbox"
           - "-framework"

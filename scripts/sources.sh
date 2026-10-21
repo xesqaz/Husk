@@ -29,3 +29,6 @@ LIBUCONTEXT_COMMIT="9b1d8f01a6e99166f9808c79966abe10786de8b6"
 # User-mode networking. Not needed for Phase 0 (the Debian guest boots without a NIC),
 # but Android will not come up cleanly without a network, so build it now.
 SLIRP_SRC="https://github.com/utmapp/libslirp/releases/download/v4.9.1-release-mirror/libslirp-v4.9.1.tar.gz"
+# BDWGC: a conservative collector for the Java object heap implemented by the DVM.
+BDWGC_SRC="https://github.com/bdwgc/bdwgc/releases/download/v8.2.12/gc-8.2.12.tar.gz"
+BDWGC_SHA256="42e5194ad06ab6ffb806c83eb99c03462b495d979cda782f3c72c08af833cd4e"

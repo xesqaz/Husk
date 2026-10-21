@@ -28,6 +28,7 @@
 
 #include "husk-tl-bionic.h"
 #include "husk-tl-dexindex.h"
+#include "husk-tl-gc.h"
 #include "husk-tl-gameactivity.h"
 #include "husk-tl-ld.h"
 
@@ -336,13 +337,13 @@ static void store_job_run(void *arg)
         void (*fn)(void *, void *, int64_t, void *) = store_native("onQueryProductsSuccess");
         if (fn) fn(env, j->listener, ptr, tl_jni_new_obj_array(C("com/mojang/minecraftpe/store/Product"), 0));
     }
-    free(j);
+    tl_gc_free(j);
 }
 static void store_post(jobj *store, int what)
 {
     jobj *l = store ? tl_jni_get_field(store, "listener", "Ljava/lang/Object;").l : NULL;
     if (!l) return;
-    store_job *j = malloc(sizeof(*j)); j->listener = l; j->what = what;
+    store_job *j = tl_gc_alloc_uncollectable(sizeof(*j)); j->listener = l; j->what = what;
     tl_ga_post(store_job_run, j);
 }
 

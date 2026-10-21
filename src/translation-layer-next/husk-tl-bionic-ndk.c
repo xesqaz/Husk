@@ -5,6 +5,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-bionic.h"
+#include "husk-tl-gc.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -792,7 +793,7 @@ static void *b_ANativeWindow_fromSurface(void *env, void *surface)
     jobj *tex = surface ? tl_jni_get_field(surface, "huskTexture", "Landroid/graphics/SurfaceTexture;").l : NULL;
     if (tl_jni_pending()) { tl_jni_clear(); tex = NULL; }
     if (tex) {
-        tl_nwindow *w = calloc(1, sizeof(*w));
+        tl_nwindow *w = tl_gc_alloc_uncollectable(sizeof(*w));
         atomic_store(&w->refs, 1); w->format = 1; w->texture = tl_jni_ref(tex);
         jobj *sz = tl_jni_call(tex, "huskSize", "()[I", NULL).l;
         if (tl_jni_pending()) tl_jni_clear();
@@ -807,7 +808,7 @@ static void b_ANativeWindow_acquire(tl_nwindow *w) { if (w) atomic_fetch_add(&w-
 static void b_ANativeWindow_release(tl_nwindow *w)
 {
     if (!w) return;
-    if (atomic_fetch_sub(&w->refs, 1) == 1 && w != &g_window) { free(w->bits); free(w); }
+    if (atomic_fetch_sub(&w->refs, 1) == 1 && w != &g_window) { tl_gc_free(w->bits); tl_gc_free(w); }
 }
 /* software drawing (ANativeWindow_lock): only texture windows have a buffer the app can write */
 typedef struct { int32_t width, height, stride, format; void *bits; uint32_t reserved[6]; } tl_nwbuffer;
@@ -815,7 +816,7 @@ static int b_ANativeWindow_lock(tl_nwindow *w, tl_nwbuffer *out, void *dirty)
 {
     (void)dirty;
     if (!w || !w->texture || !out) return -22;
-    if (!w->bits) w->bits = calloc((size_t)w->width * w->height, 4);
+    if (!w->bits) w->bits = tl_gc_alloc_atomic((size_t)w->width * w->height * 4);
     if (!w->bits) return -12;
     out->width = w->width; out->height = w->height; out->stride = w->width; out->format = 1; out->bits = w->bits;
     return 0;

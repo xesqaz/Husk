@@ -3,7 +3,7 @@ name: Build test IPA
 on:
   workflow_dispatch:
   push:
-    branches: [fix/viper-sensor-api]
+    branches: [fix/viper-sensor-api, fix/retroworld-memory-pressure]
 
 permissions:
   contents: write
@@ -26,7 +26,7 @@ jobs:
 
       - name: Host tools
         run: |
-          brew install python meson ninja pkg-config xcodegen qemu e2fsprogs bison flex gettext
+          brew install python cmake meson ninja pkg-config xcodegen qemu e2fsprogs bison flex gettext
           BREW_PREFIX="$(brew --prefix)"
           "$BREW_PREFIX/bin/python3" -m pip install --break-system-packages --user pyyaml mako packaging
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
@@ -138,6 +138,6 @@ jobs:
           gh release create "$tag" build/Husk.ipa \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Husk test IPA #${GITHUB_RUN_NUMBER}" \
-            --notes "Automated test build for the ViperGames Stickman Dismounting compatibility fix." \
+            --title "Husk test IPA — DVM garbage collection fix #${GITHUB_RUN_NUMBER}" \
+            --notes "Automated test build with garbage collection for the embedded DVM to reclaim unreachable Java objects and reduce Retro World memory accumulation. The previously tested Stickman Dismounting compatibility baseline is retained." \
             --prerelease

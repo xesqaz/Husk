@@ -13,8 +13,8 @@ step() { printf '\n\033[1;34m##### %s\033[0m\n' "$*"; }
 step "fetch sources"
 ./scripts/fetch_sources.sh
 
-step "dependencies: libffi glib pixman libucontext libslirp"
-./scripts/build_ios.sh libffi glib pixman libucontext libslirp
+step "dependencies: libffi glib pixman libucontext libslirp bdwgc"
+./scripts/build_ios.sh libffi glib pixman libucontext libslirp bdwgc
 
 # build_gpu_ios.sh asks for cross-ios-darwin.meson, which no script generates.
 # build_ios.sh writes cross-darwin.meson, the file it describes (host system

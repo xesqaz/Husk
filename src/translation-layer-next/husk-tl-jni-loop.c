@@ -19,6 +19,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-jni.h"
+#include "husk-tl-gc.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -136,14 +137,14 @@ static void collect_member(const char *name, const char *sig, uint32_t flags, vo
 }
 static jobj *members(jobj *cls, bool methods, bool ctors, const char *elem)
 {
-    member_walk *w = calloc(1, sizeof(*w));
+    member_walk walk = {0};
+    member_walk *w = &walk;
     w->cls = cls; w->methods = methods; w->ctors = ctors;
     const char *name = tl_jni_class_name(cls);
     if (tl_dexidx_has_class(name)) tl_dexidx_each_member(name, methods, collect_member, w);
     else tl_jni_each_known_member(cls, methods, collect_member, w);
     jobj *arr = tl_jni_new_obj_array(C(elem), (uint32_t)w->n);
     for (int i = 0; i < w->n; i++) arr->oarr.v[i] = w->items[i];
-    free(w);
     return arr;
 }
 static void Class_getDeclaredMethods(tl_jcall *c) { c->ret = vl(members(c->self, true, false, "java/lang/reflect/Method")); }
@@ -225,7 +226,7 @@ static void *looper_thread(void *arg);
 
 static looper *looper_new(const char *name)
 {
-    looper *l = calloc(1, sizeof(*l));
+    looper *l = tl_gc_alloc(sizeof(*l));
     pthread_mutex_init(&l->mu, NULL);
     pthread_cond_init(&l->cv, NULL);
     snprintf(l->name, sizeof(l->name), "%s", name);
@@ -247,7 +248,11 @@ static void looper_start(looper *l)
     pthread_attr_setstacksize(&a, 4u << 20);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t t;
-    if (pthread_create(&t, &a, looper_thread, l)) tl_log_line("looper: could not start '%s'", l->name);
+    tl_gc_global_ref_add(l->mirror);
+    if (pthread_create(&t, &a, looper_thread, l)) {
+        tl_gc_global_ref_remove(l->mirror);
+        tl_log_line("looper: could not start '%s'", l->name);
+    }
     pthread_attr_destroy(&a);
 }
 
@@ -275,7 +280,7 @@ static void enqueue(looper *l, ev *e)
 static void ev_free(ev *e)
 {
     tl_jni_unref(e->handler); tl_jni_unref(e->msg); tl_jni_unref(e->run); tl_jni_unref(e->frame);
-    free(e);
+    tl_gc_free(e);
 }
 
 /* ----------------------------------------------------- Java proxy callbacks */
@@ -373,6 +378,7 @@ static void *looper_thread(void *arg)
         pthread_mutex_lock(&l->mu);
     }
     pthread_mutex_unlock(&l->mu);
+    tl_gc_global_ref_remove(l->mirror);
     return NULL;
 }
 
@@ -434,7 +440,7 @@ static void post_message(jobj *handler_obj, jobj *msg, int64_t delay_ns)
 {
     handler *h = handler_obj ? handler_obj->native : NULL;
     if (!h || !msg) return;
-    ev *e = calloc(1, sizeof(*e));
+    ev *e = tl_gc_alloc(sizeof(*e));
     e->when = now_ns() + delay_ns;
     e->handler = tl_jni_ref(handler_obj);
     e->msg = tl_jni_ref(msg);
@@ -450,7 +456,7 @@ static void Message_sendToTarget(tl_jcall *c)
 
 static void handler_init(tl_jcall *c, looper *lp, jobj *callback)
 {
-    handler *h = calloc(1, sizeof(*h));
+    handler *h = tl_gc_alloc(sizeof(*h));
     h->lp = lp ? lp : current_or_main();
     h->callback = callback ? tl_jni_ref(callback) : NULL;
     c->self->native = h;
@@ -465,7 +471,7 @@ static bool post_runnable(jobj *self, jobj *run, int64_t delay_ns)
 {
     handler *h = self ? self->native : NULL;
     if (!h || !run) return false;
-    ev *e = calloc(1, sizeof(*e));
+    ev *e = tl_gc_alloc(sizeof(*e));
     e->when = now_ns() + delay_ns;
     e->handler = tl_jni_ref(self);
     e->run = tl_jni_ref(run);
@@ -567,7 +573,7 @@ static void Activity_runOnUiThread(tl_jcall *c)
 {
     looper *m = main_looper();
     if (t_looper == m) { run_runnable(c->args[0].l); return; }
-    ev *e = calloc(1, sizeof(*e));
+    ev *e = tl_gc_alloc(sizeof(*e));
     e->when = now_ns();
     e->run = tl_jni_ref(c->args[0].l);
     enqueue(m, e);
@@ -594,7 +600,7 @@ static void post_frame(jobj *self, jobj *cb, int64_t delay_ns)
     looper *l = looper_of(self);
     if (!l || !cb) return;
     int64_t t = now_ns() + delay_ns;
-    ev *e = calloc(1, sizeof(*e));
+    ev *e = tl_gc_alloc(sizeof(*e));
     e->when = (t / VSYNC_NS + 1) * VSYNC_NS;       /* the next 60 Hz boundary after t */
     e->frame = tl_jni_ref(cb);
     enqueue(l, e);

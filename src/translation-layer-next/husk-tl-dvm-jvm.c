@@ -16,6 +16,7 @@
 
 #include "husk-tl-bionic.h"
 #include "husk-tl-jni.h"
+#include "husk-tl-gc.h"
 
 extern bool tl_dvm_load_library(const char *name_or_path);
 extern void tl_va_snprintf(void);
@@ -31,10 +32,10 @@ static int64_t J_GetNanoTimeAdjustment(void *env, void *cls, int64_t offset_secs
 }
 static void J_Exit(int code) { tl_log_line("dvm: JVM_Exit(%d)", code); _exit(code); }
 static void *J_FindLibraryEntry(void *handle, const char *name) { (void)handle; (void)name; return NULL; }
-static int64_t J_FreeMemory(void) { return 256ll << 20; }
-static int64_t J_MaxMemory(void) { return 512ll << 20; }
-static int64_t J_TotalMemory(void) { return 512ll << 20; }
-static void J_GC(void) {}
+static int64_t J_FreeMemory(void) { return tl_gc_free_bytes(); }
+static int64_t J_MaxMemory(void) { return tl_gc_process_limit(); }
+static int64_t J_TotalMemory(void) { return tl_gc_total_bytes(); }
+static void J_GC(void) { tl_gc_collect(); }
 static int J_GetLastErrorString(char *buf, int len) { if (len > 0) snprintf(buf, (size_t)len, "%s", strerror(errno)); return (int)strlen(buf); }
 static int J_InitializeSocketLibrary(void) { return 0; }
 static uint8_t J_IsNaN(double d) { return isnan(d); }
@@ -45,7 +46,6 @@ static void *J_NativeLoad(void *env, jobj *filename, void *loader)
     if (f && tl_dvm_load_library(f)) return NULL;
     char msg[600]; snprintf(msg, sizeof(msg), "dlopen failed: library \"%s\" not found", f ? f : "?");
     jobj *s = tl_jni_new_string(msg);
-    s->refs = 1u << 30;
     return s;
 }
 static void J_Sync(void) { sync(); }

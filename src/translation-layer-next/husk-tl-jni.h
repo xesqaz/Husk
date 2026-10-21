@@ -48,6 +48,7 @@ struct jobj {
     uint32_t nfields;
     void *native;                       /* an implementation's own state */
     void *monitor;
+    uint32_t legacy_root_index;         /* temporary index before the DVM collector starts */
 };
 
 /* What an implemented Java method receives. */

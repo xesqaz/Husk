@@ -7,7 +7,7 @@
 # builds ~25, since we have no spice/gstreamer/virgl/MoltenVK/usb/tpm surface.
 #
 # Usage: ./scripts/build_ios.sh [stage ...]      (no args = all stages)
-#        stages: libffi glib pixman libucontext libslirp qemu
+#        stages: libffi glib pixman libucontext libslirp bdwgc qemu
 set -uo pipefail
 
 HUSK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -154,6 +154,29 @@ stage_pixman()      { apply_patch pixman-0.38.0 pixman-0.38.0.patch
 stage_libucontext() { build_meson libucontext "$CROSS_IOS" -Dfreestanding=true; }
 stage_libslirp()    { apply_patch libslirp-v4.9.1 libslirp-v4.9.1.patch
                       build_meson libslirp-v4.9.1 "$CROSS_DARWIN"; }
+stage_bdwgc() {
+    local name="bdwgc" dir="$SRC/gc-8.2.12" log="$LOGS/bdwgc.log"
+    done_stage "$name" && { echo "[skip] $name"; return 0; }
+    banner "building $name (cmake)"
+    rm -rf "$dir/_husk_build"
+    ( cmake -S "$dir" -B "$dir/_husk_build" -G Ninja \
+          -DCMAKE_SYSTEM_NAME=iOS \
+          -DCMAKE_OSX_SYSROOT="$SDKROOT" \
+          -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET="$SDKMINVER" \
+          -DCMAKE_C_COMPILER="$(xcrun --sdk "$SDK" --find clang)" \
+          -DCMAKE_C_FLAGS="$CFLAGS" \
+          -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
+          -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+          -DBUILD_SHARED_LIBS=OFF -Dbuild_cord=OFF -Dbuild_tests=OFF \
+          -Denable_docs=OFF -Denable_threads=ON \
+          -Denable_threads_discovery=ON -Denable_thread_local_alloc=OFF \
+          -Denable_parallel_mark=OFF -Denable_gcj_support=OFF \
+          -Denable_dynamic_loading=ON -Dinstall_headers=ON \
+      && cmake --build "$dir/_husk_build" --parallel "$NCPU" \
+      && cmake --install "$dir/_husk_build" ) > "$log" 2>&1 || fail "$name" "$log"
+    mark_stage "$name"
+}
 
 stage_qemu() {
     local dir="$SRC/qemu-10.0.12-utm"
@@ -213,7 +236,7 @@ husk_stage_dylib() {
 }
 
 STAGES=("$@")
-[ ${#STAGES[@]} -eq 0 ] && STAGES=(libffi glib pixman libucontext libslirp qemu)
+[ ${#STAGES[@]} -eq 0 ] && STAGES=(libffi glib pixman libucontext libslirp bdwgc qemu)
 
 echo "HUSK build: PREFIX=$PREFIX"
 echo "            SDK=$SDKROOT ($SDKVERSION), min=$SDKMINVER, ncpu=$NCPU"
