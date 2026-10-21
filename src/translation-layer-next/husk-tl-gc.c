@@ -2,7 +2,7 @@
 #define _DARWIN_C_SOURCE
 #include "husk-tl-gc.h"
 
-#include <libproc.h>
+#include <mach/mach.h>
 #include <os/proc.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
-#include <unistd.h>
 
 #define GC_NO_THREAD_REDIRECTS
 #define GC_THREADS
@@ -152,10 +151,11 @@ int64_t tl_gc_total_bytes(void)
 
 int64_t tl_gc_process_limit(void)
 {
-    rusage_info_current usage;
-    if (proc_pid_rusage(getpid(), RUSAGE_INFO_CURRENT, &usage) != 0) return 0;
+    task_vm_info_data_t usage;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&usage, &count) != KERN_SUCCESS) return 0;
     size_t available = os_proc_available_memory();
-    uint64_t footprint = usage.ri_phys_footprint;
+    uint64_t footprint = usage.phys_footprint;
     if (available > UINT64_MAX - footprint) return INT64_MAX;
     uint64_t limit = footprint + available;
     return limit > INT64_MAX ? INT64_MAX : (int64_t)limit;
